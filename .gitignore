@@ -1,0 +1,9 @@
+# Build output (built from main.swift via build.sh)
+KVM Switch.app/
+
+# Archives
+*.zip
+
+# macOS
+.DS_Store
+__MACOSX/
