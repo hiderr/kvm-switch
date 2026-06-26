@@ -4,6 +4,7 @@ import Network
 import AppKit
 import SwiftUI
 import ServiceManagement
+import ApplicationServices
 
 // MARK: - Constants
 
@@ -326,6 +327,7 @@ private final class Node {
   private var outBuffer = Data()
 
   private var tapPort: CFMachPort?
+  private var tapInstalled = false
   var onStatus: (() -> Void)?
 
   private static let mask: CGEventMask = {
@@ -368,6 +370,9 @@ private final class Node {
     if config.edgeEnabled {
       lines.append("Край экрана: вкл (\(config.edgeDirection.display))")
     }
+    let capture = tapInstalled ? "✓" : "✗ нет Input Monitoring"
+    let inject = AXIsProcessTrusted() ? "✓" : "✗ нет Accessibility"
+    lines.append("Права: перехват \(capture), инъекция \(inject)")
     return lines
   }
 
@@ -387,7 +392,7 @@ private final class Node {
     startOutConnection()
     installTap()
     discovery.start()
-    log("node ready (symmetric). hotkey=\(config.hotkey.display)")
+    log("node ready (symmetric). hotkey=\(config.hotkey.display) capture=\(tapInstalled) accessibility=\(AXIsProcessTrusted())")
   }
 
   func applyLinkConfig() {
@@ -626,6 +631,7 @@ private final class Node {
     CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
     CGEvent.tapEnable(tap: tap, enable: true)
     tapPort = tap
+    tapInstalled = true
   }
 
   private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
