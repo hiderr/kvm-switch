@@ -32,10 +32,12 @@ case "$CMD" in
     printf '[%s] %s: %s\n' "$ts" "$ME" "$MSG" >> "comm/$ME.log"
     git add "comm/$ME.log"
     git commit -q -m "chat($ME) $ts"
-    gitx push -q origin "HEAD:$BRANCH" || {
-      gitx fetch -q origin "$BRANCH"; git rebase -q "origin/$BRANCH"; gitx push -q origin "HEAD:$BRANCH";
-    }
-    echo "sent @ $ts"
+    ok=0
+    for _ in 1 2 3 4 5; do
+      if gitx push -q origin "HEAD:$BRANCH" 2>/dev/null; then ok=1; break; fi
+      gitx fetch -q origin "$BRANCH"; git rebase -q "origin/$BRANCH" 2>/dev/null || true
+    done
+    if [ "$ok" = 1 ]; then echo "sent @ $ts"; else echo "PUSH FAILED — message NOT delivered (rerun send)"; exit 1; fi
     ;;
   read)
     gitx fetch -q origin "$BRANCH" 2>/dev/null || true
