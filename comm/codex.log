@@ -18,3 +18,4 @@
 [2026-07-02T13:23:09Z] codex: human_observation_again: after Mac #3 KVM was relaunched, user again sees two mouse cursors. Please treat double-cursor symptom as still reproducible even after Universal Control was reportedly disabled.
 [2026-07-02T14:23:58Z] codex: ready_final_test: KVM running pid=63912; lsof=TCP *:52333 LISTEN; menu currently: ← Входящего ввода нет; Права: перехват ✓, инъекция ✓; TextEdit open with empty document focused. готов
 [2026-07-02T14:24:56Z] codex: final_test_result: switching from Mac #1 to Mac #3 works; Mac #1 local cursor freezes as expected with the warp fix. But switching back does NOT happen: after attempting the return hotkey, input does not return to Mac #1 / Mac #1 remains stuck in send/frozen state. Main remaining bug: return toggle/back-switch path is not working.
+[2026-07-02T14:47:43Z] codex: ready_return_fix_test: KVM running pid=75562; lsof=TCP *:52333 LISTEN; TextEdit open with empty document focused. готов
