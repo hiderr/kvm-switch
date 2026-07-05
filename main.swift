@@ -14,9 +14,23 @@ private let kRecordSize = 32
 // (prevents an inject -> tap -> forward feedback loop in symmetric mode).
 private let kInjectedMagic: Int64 = 0x4B564D31 // "KVM1"
 
+private let kDebugLogURL: URL = {
+  let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("KVM Switch", isDirectory: true)
+  try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+  return dir.appendingPathComponent("debug.log")
+}()
+
 private func log(_ msg: String) {
   let ts = ISO8601DateFormatter().string(from: Date())
-  FileHandle.standardError.write("[\(ts)] \(msg)\n".data(using: .utf8)!)
+  let line = "[\(ts)] \(msg)\n"
+  FileHandle.standardError.write(line.data(using: .utf8)!)
+  guard let data = line.data(using: .utf8) else { return }
+  if let fh = try? FileHandle(forWritingTo: kDebugLogURL) {
+    fh.seekToEndOfFile(); fh.write(data); try? fh.close()
+  } else {
+    try? data.write(to: kDebugLogURL)
+  }
 }
 
 private func mainAsync(_ work: @escaping () -> Void) {
@@ -310,6 +324,9 @@ private final class Node {
   private var pendingToggleUpSwallow = false
   private let netQueue = DispatchQueue(label: "kvm.net")
   private var reconnectScheduled = false
+  private var frozenCursorPoint = CGPoint.zero
+  private let pinQueue = DispatchQueue(label: "kvm.cursorpin")
+  private var cursorPinTimer: DispatchSourceTimer?
 
   // receiver side
   private var listener: NWListener?
@@ -576,6 +593,7 @@ private final class Node {
     outConn?.cancel(); outConn = nil
     if mode == .remote {
       mode = .local
+      unlockLocalCursor()
       NSSound.beep()
       log("SAFETY: out link lost while remote -> local")
     }
@@ -636,6 +654,7 @@ private final class Node {
 
   private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+      log("TAP DISABLED (\(type == .tapDisabledByTimeout ? "timeout" : "userInput")) -> re-enabling")
       if let tap = tapPort { CGEvent.tapEnable(tap: tap, enable: true) }
       return nil
     }
@@ -648,6 +667,9 @@ private final class Node {
     if type == .keyDown {
       let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
       let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+      if kc == config.hotkey.keyCode {
+        log("hotkey keycode down: mode=\(mode) flags=\(flags.rawValue) repeat=\(isRepeat) matched=\(config.hotkey.matches(keyCode: kc, flags: flags))")
+      }
       if !isRepeat, config.hotkey.matches(keyCode: kc, flags: flags) {
         toggleMode(); pendingToggleUpSwallow = true; return nil
       }
@@ -713,11 +735,40 @@ private final class Node {
     switch mode {
     case .local:
       guard outReady else { NSSound.beep(); log("toggle ignored: out link not ready"); return }
-      mode = .remote; log("mode=remote (input -> peer)")
+      mode = .remote
+      lockLocalCursor()
+      log("mode=remote (input -> peer)")
     case .remote:
-      mode = .local; log("mode=local")
+      mode = .local
+      unlockLocalCursor()
+      log("mode=local")
     }
     NSSound.beep(); notify()
+  }
+
+  // Trackpad movement isn't reliably frozen by disassociation alone on this macOS,
+  // so a dedicated timer re-pins the pointer to its captured spot. The warp runs off
+  // the event-tap thread on purpose — warping inside the tap callback overruns its
+  // deadline and gets the tap disabled, which then eats the return hotkey.
+  private func lockLocalCursor() {
+    frozenCursorPoint = CGEvent(source: nil)?.location ?? frozenCursorPoint
+    CGAssociateMouseAndMouseCursorPosition(0)
+    CGDisplayHideCursor(CGMainDisplayID())
+    let timer = DispatchSource.makeTimerSource(queue: pinQueue)
+    timer.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(2))
+    timer.setEventHandler { [weak self] in
+      guard let self = self else { return }
+      CGWarpMouseCursorPosition(self.frozenCursorPoint)
+    }
+    cursorPinTimer = timer
+    timer.resume()
+  }
+
+  private func unlockLocalCursor() {
+    cursorPinTimer?.cancel()
+    cursorPinTimer = nil
+    CGDisplayShowCursor(CGMainDisplayID())
+    CGAssociateMouseAndMouseCursorPosition(1)
   }
 }
 
@@ -877,6 +928,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     node.onStatus = { [weak self] in self?.refreshIcon() }
     node.start()
     refreshIcon()
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    CGDisplayShowCursor(CGMainDisplayID())
+    CGAssociateMouseAndMouseCursorPosition(1)
   }
 
   private func refreshIcon() { statusItem.button?.title = node.iconTitle }
