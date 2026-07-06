@@ -447,6 +447,15 @@ private final class Node {
           self.incomingPeer = endpointLabel(conn.endpoint)
           self.notify()
         }
+        // A fresh incoming means the peer (re)started its stack; our existing
+        // outgoing link is then half-open (still ESTABLISHED here, dead there) so
+        // forwards would black-hole. Rebuild it.
+        self.netQueue.async {
+          if self.outReady {
+            log("peer reconnected -> refreshing stale outgoing link")
+            self.dropAndReconnect()
+          }
+        }
         self.receiveLoop(conn)
       }
       l.start(queue: injectQueue)
