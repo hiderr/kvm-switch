@@ -752,7 +752,7 @@ private final class Node {
       unlockLocalCursor()
       log("mode=local")
     }
-    NSSound.beep(); notify()
+    notify()
   }
 
   // Trackpad movement isn't reliably frozen by disassociation alone on this macOS,
