@@ -281,12 +281,26 @@ private final class Discovery: ObservableObject {
   private var endpoints: [String: NWEndpoint] = [:]
   private var browser: NWBrowser?
   private let selfName: String
+  private let pathMonitor = NWPathMonitor()
+  private var sawFirstPath = false
 
   init(selfName: String) { self.selfName = selfName }
 
   func endpoint(for name: String) -> NWEndpoint? { endpoints[name] }
 
   func start() {
+    startBrowser()
+    // A DHCP lease change / Wi-Fi reconnect leaves the browser holding stale
+    // records so the peer is never rediscovered at its new address. Restart it
+    // on every network transition (the first callback is just the initial path).
+    pathMonitor.pathUpdateHandler = { [weak self] _ in
+      guard let self = self else { return }
+      if self.sawFirstPath { self.restartBrowser() } else { self.sawFirstPath = true }
+    }
+    pathMonitor.start(queue: .main)
+  }
+
+  private func startBrowser() {
     let params = NWParameters()
     params.includePeerToPeer = true
     let browser = NWBrowser(for: .bonjour(type: kServiceType, domain: nil), using: params)
@@ -304,7 +318,24 @@ private final class Discovery: ObservableObject {
         self.peers = map.keys.sorted()
       }
     }
+    browser.stateUpdateHandler = { [weak self] state in
+      switch state {
+      case .failed, .cancelled: self?.restartBrowser()
+      default: break
+      }
+    }
     browser.start(queue: .main)
+  }
+
+  private func restartBrowser() {
+    let old = browser
+    browser = nil
+    old?.stateUpdateHandler = nil   // detach so its .cancelled doesn't re-enter here
+    old?.cancel()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+      guard let self = self, self.browser == nil else { return }
+      self.startBrowser()
+    }
   }
 }
 
