@@ -523,12 +523,37 @@ private final class Node {
     }
   }
 
+  // keycode -> the raw modifier-flag bit reflecting THIS physical key's state.
+  // Device-dependent left/right bits (NX_DEVICE*KEYMASK) let each side be tracked
+  // independently, so right Command is replayed as right Command, not a generic one.
+  private static let modifierBit: [UInt16: UInt64] = [
+    59: 0x1,       // left control
+    62: 0x2000,    // right control
+    56: 0x2,       // left shift
+    60: 0x4,       // right shift
+    55: 0x8,       // left command
+    54: 0x10,      // right command
+    58: 0x20,      // left option
+    61: 0x40,      // right option
+    57: 0x10000,   // caps lock (maskAlphaShift)
+    63: 0x800000,  // fn (maskSecondaryFn)
+  ]
+
   private func inject(_ ev: InputEvent) {
     guard let type = CGEventType(rawValue: ev.cgType) else { return }
     let flags = CGEventFlags(rawValue: ev.flags)
     switch type {
     case .keyDown, .keyUp:
       guard let e = CGEvent(keyboardEventSource: injectSource, virtualKey: ev.keyCode, keyDown: type == .keyDown) else { return }
+      e.flags = flags
+      e.post(tap: .cghidEventTap)
+    case .flagsChanged:
+      // Replay a modifier transition: press if this key's device bit is now set,
+      // release if it is now clear. Posting a keyDown/keyUp for the modifier's
+      // virtual key makes the system register the correct flagsChanged state.
+      guard let bit = Node.modifierBit[ev.keyCode] else { return }
+      let isDown = (ev.flags & bit) != 0
+      guard let e = CGEvent(keyboardEventSource: injectSource, virtualKey: ev.keyCode, keyDown: isDown) else { return }
       e.flags = flags
       e.post(tap: .cghidEventTap)
     case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
@@ -748,12 +773,13 @@ private final class Node {
   ]
 
   private func forward(type: CGEventType, event: CGEvent, flags: CGEventFlags) {
-    if type == .flagsChanged { return }
     var ev = InputEvent()
     ev.cgType = type.rawValue
     ev.flags = flags.rawValue
     switch type {
-    case .keyDown, .keyUp:
+    case .keyDown, .keyUp, .flagsChanged:
+      // flagsChanged carries the modifier keycode; the receiver replays it as a
+      // modifier key press/release so both Command sides (and all modifiers) cross.
       ev.keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
     case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
       ev.dx = event.getDoubleValueField(.mouseEventDeltaX)
