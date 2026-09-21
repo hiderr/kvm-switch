@@ -19,7 +19,7 @@ swiftc -O -o "$BIN" main.swift \
 # pinned to the cert (not a per-build ad-hoc cdhash) and TCC grants
 # (Accessibility / Input Monitoring) survive rebuilds. Falls back to ad-hoc if
 # the identity is missing (run ./setup-signing.sh once to create it).
-IDENTITY="KVM Switch Signing"
+IDENTITY="${KVM_SIGNING_IDENTITY:-KVM Switch Signing}"
 if security find-certificate -c "$IDENTITY" "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1; then
   codesign --force --deep --sign "$IDENTITY" "$APP"
 else
