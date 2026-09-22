@@ -40,6 +40,7 @@ extension Node {
           let key = UInt16(object["key"] as? Int ?? 7)
           let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: type == .keyDown)!
           event.flags = []
+          if action == "physical" { event.setIntegerValueField(.eventSourceUnixProcessID, value: 0) }
           probeLastPassed = node.handle(type: type, event: event) != nil
         case "stop": node.stop(); exit(0)
         default: break

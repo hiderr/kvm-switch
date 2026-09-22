@@ -103,6 +103,19 @@ extension Node {
   }
 
   static func runUnitTests() {
+    var pressure = EdgePressure()
+    pressure.add(80, now: 1)
+    pressure.add(50, now: 1.1)
+    expect(pressure.amount == 130, "continuous outward push still reaches switching threshold")
+    pressure.reset()
+    pressure.add(80, now: 2)
+    pressure.add(50, now: 3)
+    expect(pressure.amount == 50, "separate edge gestures do not accumulate across a pause")
+    pressure.add(0, now: 3.1)
+    pressure.add(80, now: 3.2)
+    expect(pressure.amount == 80, "stopping or reversing an outward push resets edge pressure")
+    pressure.add(-1, now: 3.3)
+    expect(pressure.amount == 0, "leaving the edge resets pressure")
     var cursorLease = CursorLease(deadline: 101)
     expect(cursorLease.valid(at: 100) && !cursorLease.ended,
            "cursor lease remains active before deadline")
@@ -147,9 +160,72 @@ extension Node {
     expect(decoded.count == 2 && buffer.isEmpty, "fragmented and coalesced frames parse")
     expect(decoded[0].flags == original.flags && decoded[0].dx == original.dx &&
            decoded[0].keyCode == 42 && decoded[1].flags == 991, "wire values and heartbeat token survive framing")
-    buffer = Data([0, 0, 0, 255, 1, 2, 3])
+    buffer = Data([0, 0, 0, 20, 1, 2, 3])
     parseFrames(&buffer) { _ in expect(false, "malformed frame never dispatched") }
     expect(buffer.isEmpty, "malformed length discards buffer")
+
+    let gestureSource = CGEventSource(stateID: .privateState)!
+    func gesture(hid: Int64, phase: Int64, field: UInt32, value: Double) -> CGEvent {
+      let e = CGEvent(source: gestureSource)!
+      e.type = kGestureType
+      e.setIntegerValueField(CGEventField(rawValue: 110)!, value: hid)
+      e.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
+      e.setDoubleValueField(CGEventField(rawValue: field)!, value: value)
+      return e
+    }
+    let pinch = gesture(hid: 8, phase: 2, field: 113, value: 0.33)
+    var rawRecord = InputEvent(cgType: kGestureType.rawValue, raw: pinch.data! as Data)
+    buffer = rawRecord.encoded() + rawRecord.encoded().prefix(9)
+    var rawDecoded: [InputEvent] = []
+    parseFrames(&buffer) { rawDecoded.append($0) }
+    expect(rawDecoded.count == 1 && rawDecoded[0].cgType == kGestureType.rawValue &&
+           rawDecoded[0].raw == rawRecord.raw && buffer.count == 9,
+           "variable-length raw event frame parses and leaves the next partial frame")
+    rawRecord.raw = Data(count: kRawEventMax + 1)
+    buffer = rawRecord.encoded()
+    parseFrames(&buffer) { _ in expect(false, "oversized raw frame never dispatched") }
+    expect(buffer.isEmpty, "oversized raw frame discards buffer")
+
+    let gestureRecorder = EventRecorder()
+    let gestureReceiver = testNode(gestureRecorder)
+    gestureReceiver.receivingRemote = true
+    gestureReceiver.cursor = CGPoint(x: 321, y: 123)
+    gestureReceiver.inject(InputEvent(cgType: kGestureType.rawValue, raw: pinch.data! as Data))
+    let magnify = gestureRecorder.events.last.flatMap { NSEvent(cgEvent: $0) }
+    expect(gestureRecorder.events.count == 1 && magnify?.type == .magnify &&
+           abs((magnify?.magnification ?? 0) - 0.33) < 0.001 && magnify?.phase == .changed &&
+           gestureRecorder.events[0].location == gestureReceiver.cursor &&
+           gestureRecorder.events[0].getIntegerValueField(.eventSourceUserData) == kInjectedMagic &&
+           gestureRecorder.events[0].timestamp > 0,
+           "raw pinch injects a stamped magnify event at the remote cursor")
+    for (hid, field, wanted) in [(Int64(5), UInt32(114), NSEvent.EventType.rotate),
+                                 (22, 115, .smartMagnify), (16, 115, .swipe), (32, 113, .pressure)] {
+      gestureReceiver.inject(InputEvent(cgType: kGestureType.rawValue, raw: gesture(hid: hid, phase: 4, field: field, value: 1).data! as Data))
+      expect(gestureRecorder.events.last.flatMap { NSEvent(cgEvent: $0) }?.type == wanted,
+             "raw gesture HID type \(hid) injects as NSEvent \(wanted.rawValue)")
+    }
+    let trackpadScroll = CGEvent(scrollWheelEvent2Source: gestureSource, units: .pixel, wheelCount: 2, wheel1: -7, wheel2: 2, wheel3: 0)!
+    trackpadScroll.setIntegerValueField(.scrollWheelEventScrollPhase, value: 4)
+    trackpadScroll.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: -7.4)
+    let scrollCount = gestureRecorder.events.count
+    gestureReceiver.inject(InputEvent(cgType: CGEventType.scrollWheel.rawValue, dx: 2, dy: -7, raw: trackpadScroll.data! as Data))
+    let scroll = gestureRecorder.events.last.flatMap { NSEvent(cgEvent: $0) }
+    expect(gestureRecorder.events.count == scrollCount + 1 && scroll?.type == .scrollWheel &&
+           scroll?.phase == .ended && scroll?.hasPreciseScrollingDeltas == true &&
+           abs((gestureRecorder.events.last?.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1) ?? 0) + 7.4) < 0.001 &&
+           gestureRecorder.events.last?.location == gestureReceiver.cursor,
+           "raw trackpad scroll keeps phase and fixed-point deltas")
+    let rejected = gestureRecorder.events.count
+    let rawKey = CGEvent(keyboardEventSource: gestureSource, virtualKey: 36, keyDown: true)!
+    gestureReceiver.inject(InputEvent(cgType: CGEventType.keyDown.rawValue, keyCode: 36, raw: rawKey.data! as Data))
+    gestureReceiver.inject(InputEvent(cgType: kGestureType.rawValue, raw: rawKey.data! as Data))
+    gestureReceiver.inject(InputEvent(cgType: CGEventType.scrollWheel.rawValue, raw: pinch.data! as Data))
+    gestureReceiver.inject(InputEvent(cgType: kGestureType.rawValue, raw: Data([1, 2, 3])))
+    gestureReceiver.receivingRemote = false
+    gestureReceiver.inject(InputEvent(cgType: kGestureType.rawValue, raw: pinch.data! as Data))
+    expect(gestureRecorder.events.count == rejected && gestureReceiver.injectedKeys.isEmpty,
+           "raw payloads only inject scroll/gesture events whose type matches the record while receiving")
+    expect(Node.mask & (1 << kGestureType.rawValue) != 0, "event tap captures multitouch gesture events")
 
     let node = testNode()
     let key = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)!
@@ -189,13 +265,67 @@ extension Node {
     key.setIntegerValueField(.eventSourceUserData, value: kInjectedMagic)
     expect(receiver.handle(type: .keyDown, event: key) != nil && receiver.receivingRemote,
            "injected events never claim physical ownership")
+    let softwareSource = CGEventSource(stateID: .combinedSessionState)!
+    softwareSource.userData = 0
+    receiver.inject(InputEvent(cgType: CGEventType.keyDown.rawValue, keyCode: 4))
+    let beforeSoftwareInput = recorder.events.count
+    for (code, flags) in [(UInt16(36), CGEventFlags()), (9, .maskCommand),
+                          (receiver.config.hotkey.keyCode, receiver.config.hotkey.requiredFlags)] {
+      for down in [true, false] {
+        let softwareKey = CGEvent(keyboardEventSource: softwareSource, virtualKey: code, keyDown: down)!
+        softwareKey.flags = flags
+        softwareKey.setIntegerValueField(.eventSourceUnixProcessID, value: 1234)
+        expect(receiver.handle(type: softwareKey.type, event: softwareKey) != nil && receiver.receivingRemote &&
+               receiver.injectedKeys == [4] && receiver.localKeys.isEmpty && receiver.reservedToggleKeys.isEmpty &&
+               recorder.events.count == beforeSoftwareInput,
+               "software Enter/paste/shortcut passes locally without ending remote session: key=\(code), down=\(down)")
+      }
+    }
+    for type in Node.moveTypes {
+      let stationary = CGEvent(mouseEventSource: softwareSource, mouseType: type,
+                               mouseCursorPosition: CGPoint(x: 100, y: 100), mouseButton: .left)!
+      stationary.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
+      stationary.setDoubleValueField(.mouseEventDeltaX, value: 0)
+      stationary.setDoubleValueField(.mouseEventDeltaY, value: 0)
+      expect(receiver.handle(type: type, event: stationary) != nil && receiver.receivingRemote &&
+             recorder.events.count == beforeSoftwareInput,
+             "zero-delta mouse notification does not claim ownership: \(type.rawValue)")
+    }
+    let softwareMove = CGEvent(mouseEventSource: softwareSource, mouseType: .mouseMoved,
+                              mouseCursorPosition: .zero, mouseButton: .left)!
+    softwareMove.setIntegerValueField(.eventSourceUnixProcessID, value: 1234)
+    softwareMove.setDoubleValueField(.mouseEventDeltaX, value: 20)
+    expect(receiver.handle(type: .mouseMoved, event: softwareMove) != nil && receiver.receivingRemote,
+           "software cursor movement does not claim physical ownership")
+    let softwareModifier = CGEvent(keyboardEventSource: softwareSource, virtualKey: 55, keyDown: true)!
+    softwareModifier.type = .flagsChanged
+    softwareModifier.flags = CGEventFlags(rawValue: CGEventFlags.maskCommand.rawValue | 0x8)
+    softwareModifier.setIntegerValueField(.eventSourceUnixProcessID, value: 1234)
+    expect(receiver.handle(type: .flagsChanged, event: softwareModifier) != nil && receiver.receivingRemote &&
+           receiver.localKeys.isEmpty && recorder.events.count == beforeSoftwareInput,
+           "software paste modifier does not cancel session or leave a locally held Command")
     let physicalSource = CGEventSource(stateID: .privateState)!
     physicalSource.userData = 0
     let physicalKey = CGEvent(keyboardEventSource: physicalSource, virtualKey: 0, keyDown: true)!
     physicalKey.flags = []
+    physicalKey.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
     let physicalResult = receiver.handle(type: .keyDown, event: physicalKey)
     expect(physicalResult != nil && !receiver.receivingRemote,
            "physical input takes local ownership and passes through")
+    expect(receiver.injectedKeys.isEmpty && recorder.events.count == beforeSoftwareInput + 1,
+           "physical takeover still releases remotely held keys")
+    for (type, dx, dy) in [(CGEventType.mouseMoved, 1.0, 0.0), (.mouseMoved, 0.0, -1.0),
+                           (.leftMouseDown, 0.0, 0.0)] {
+      let mouseReceiver = testNode()
+      mouseReceiver.receivingRemote = true
+      let physicalMouse = CGEvent(mouseEventSource: physicalSource, mouseType: type,
+                                  mouseCursorPosition: .zero, mouseButton: .left)!
+      physicalMouse.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
+      physicalMouse.setDoubleValueField(.mouseEventDeltaX, value: dx)
+      physicalMouse.setDoubleValueField(.mouseEventDeltaY, value: dy)
+      expect(mouseReceiver.handle(type: type, event: physicalMouse) != nil && !mouseReceiver.receivingRemote,
+             "physical mouse movement/click still takes local ownership: type=\(type.rawValue), dx=\(dx), dy=\(dy)")
+    }
 
     let stale = testNode()
     stale.config.port = unusedPort()
@@ -424,6 +554,7 @@ extension Node {
     physicalSource.userData = 0
     let physicalKey = CGEvent(keyboardEventSource: physicalSource, virtualKey: 0, keyDown: true)!
     physicalKey.flags = []
+    physicalKey.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
     expect(flags.handle(type: .keyDown, event: physicalKey) != nil && !flags.receivingRemote &&
            flagEvents.events.last?.type == .flagsChanged && flagEvents.events.last?.flags.isEmpty == true &&
            flags.pendingMotion == nil, "physical takeover releases modifiers after prior motion and leaves no delayed motion")
@@ -453,6 +584,18 @@ extension Node {
            .mouseMoved, .mouseMoved], "keyboard, scroll and heartbeat records are strict movement barriers")
 
     let (edge, edgeEvents, edgeConnection) = fixture()
+    for (code, flags) in [(UInt16(36), UInt64(0)), (9, CGEventFlags.maskCommand.rawValue | 0x8)] {
+      let (typing, _, connection) = fixture()
+      typing.cursor = CGPoint(x: 999, y: 100)
+      typing.config.edgeEnabled = true
+      typing.config.edgeDirection = .right
+      typing.receiveBatch([move(80),
+        InputEvent(cgType: CGEventType.keyDown.rawValue, flags: flags, keyCode: code, dx: 40),
+        InputEvent(cgType: CGEventType.keyUp.rawValue, flags: flags, keyCode: code, dx: 40),
+        move(50)], from: connection)
+      expect(typing.receivingRemote && typing.cursor == CGPoint(x: 999, y: 100),
+             "Enter/paste interrupts old edge pressure so a later small motion cannot return control: key=\(code)")
+    }
     let (reference, _, referenceConnection) = fixture()
     for node in [edge, reference] {
       node.displayBounds = CGRect(x: 0, y: 0, width: 100, height: 100)
@@ -465,7 +608,7 @@ extension Node {
                       move(80, flags: shift), move(80, flags: shift), move(-30, flags: shift)]
     for event in trajectory { reference.receive(event, from: referenceConnection) }
     edge.receiveBatch(trajectory, from: edgeConnection)
-    expect(edge.cursor == reference.cursor && edge.recvPressure == reference.recvPressure &&
+    expect(edge.cursor == reference.cursor && edge.recvPressure.amount == reference.recvPressure.amount &&
            edge.receivingRemote == reference.receivingRemote && !edge.receivingRemote,
            "batched edge pressure and return point match sequential input including boundary reversal")
     expect(edgeEvents.events.map(\.type) == [.mouseMoved, .flagsChanged] &&
@@ -579,6 +722,7 @@ extension Node {
                    bRecorder.events.contains { $0.type == .flagsChanged && $0.getIntegerValueField(.keyboardEventKeycode) == 55 && $0.flags.isEmpty } &&
                    bRecorder.events.contains { $0.type == .leftMouseUp },
                    "pre-handoff releases also travel over TCP to receiver")
+            key.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
             _ = b.handle(type: .keyDown, event: key)
             let physicalUp = CGEvent(keyboardEventSource: source, virtualKey: 7, keyDown: false)!
             physicalUp.flags = []
@@ -690,13 +834,37 @@ extension Node {
       }
     }
 
-    func checkAuxiliary(_ index: Int) {
-      guard index < auxiliary.count else {
-        print("Keyboard wire matrix: 118 ordinary codes × down/repeat/up; 10 modifier codes × press/release; 24 auxiliary codes × down/repeat/up; all 128 virtual codes covered.")
+    func checkTrackpad() {
+      let before = recorder.events.count
+      let phases: [Int64] = [1, 2, 4]
+      for phase in phases {
+        let pinch = CGEvent(source: source)!
+        pinch.type = kGestureType
+        pinch.setIntegerValueField(CGEventField(rawValue: 110)!, value: 8)
+        pinch.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
+        pinch.setDoubleValueField(CGEventField(rawValue: 113)!, value: phase == 2 ? 0.25 : 0)
+        expect(sender.handle(type: kGestureType, event: pinch) == nil, "full wire matrix captures pinch phase \(phase)")
+      }
+      let scroll = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: -9, wheel2: 0, wheel3: 0)!
+      scroll.setIntegerValueField(.scrollWheelEventScrollPhase, value: 1)
+      expect(sender.handle(type: .scrollWheel, event: scroll) == nil, "full wire matrix captures trackpad scroll")
+      eventually("full wire matrix delivers pinch and trackpad scroll", { recorder.events.count >= before + 4 }) {
+        let events = recorder.events[before..<(before + 4)].compactMap { NSEvent(cgEvent: $0) }
+        expect(events.map(\.type) == [.magnify, .magnify, .magnify, .scrollWheel] &&
+               events.map(\.phase) == [.began, .changed, .ended, .began] &&
+               abs(events[1].magnification - 0.25) < 0.001 && events[3].scrollingDeltaY == -9 &&
+               events[3].hasPreciseScrollingDeltas &&
+               recorder.events[before..<(before + 4)].allSatisfy {
+                 $0.location == receiver.cursor && $0.getIntegerValueField(.eventSourceUserData) == kInjectedMagic },
+               "full wire matrix preserves pinch phases, magnification and scroll phase over TCP")
+        print("Keyboard wire matrix: 118 ordinary codes × down/repeat/up; 10 modifier codes × press/release; 24 auxiliary codes × down/repeat/up; all 128 virtual codes covered; pinch phases and phased trackpad scroll delivered.")
         sender.stop(); receiver.stop()
         runSilentPeerTests()
-        return
       }
+    }
+
+    func checkAuxiliary(_ index: Int) {
+      guard index < auxiliary.count else { checkTrackpad(); return }
       let code = auxiliary[index], before = recorder.events.count
       for (down, repeated) in [(true, false), (true, true), (false, false)] {
         let event = AuxiliaryKey.event(code: code, down: down, repeated: repeated, source: source)!

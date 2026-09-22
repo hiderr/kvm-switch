@@ -80,6 +80,24 @@ private enum EdgeDir: String, Codable, CaseIterable {
 }
 
 private let kEdgeThreshold = 120.0 // accumulated px of "push" into the edge before switching
+private let kEdgePushGap = 0.25 // only a continuous outward push can switch
+
+private struct EdgePressure {
+  private(set) var amount = 0.0
+  private var lastPushAt = -Double.infinity
+
+  mutating func reset() {
+    amount = 0
+    lastPushAt = -Double.infinity
+  }
+
+  mutating func add(_ push: Double, now: Double = monotonicNow()) {
+    guard push > 0 else { reset(); return }
+    if now - lastPushAt > kEdgePushGap { amount = 0 }
+    amount += push
+    lastPushAt = now
+  }
+}
 
 /// Union of all active displays in global top-left coordinates (matches CGEvent.location).
 private func displaysUnion() -> CGRect {
@@ -110,6 +128,11 @@ private func endpointLabel(_ ep: NWEndpoint) -> String {
 // Keyboard records reuse button for autorepeat and dx for keyboard type.
 // Auxiliary-key records (CG type 14 / NSEvent subtype 8) use keyCode for the
 // NX key identifier, button for 0xA down / 0xB up, and clickState for repeat.
+// Trackpad scroll and multitouch gesture records (CG types 22 and 29) append
+// the serialized CGEvent (CGEventCreateData) after the 32-byte header, so scroll
+// phases, momentum, fixed-point deltas and gesture values cross unchanged.
+
+private let kRawEventMax = 4096
 
 private struct InputEvent {
   var cgType: UInt32 = 0
@@ -119,10 +142,12 @@ private struct InputEvent {
   var clickState: UInt8 = 0
   var dx: Double = 0
   var dy: Double = 0
+  var raw: Data? = nil
 
   func encoded() -> Data {
-    var out = Data(capacity: 4 + kRecordSize)
-    appendBE(&out, UInt32(kRecordSize))
+    let payload = raw ?? Data()
+    var out = Data(capacity: 4 + kRecordSize + payload.count)
+    appendBE(&out, UInt32(kRecordSize + payload.count))
     appendBE(&out, cgType)
     appendBE(&out, flags)
     appendBE(&out, keyCode)
@@ -130,6 +155,7 @@ private struct InputEvent {
     out.append(clickState)
     appendBE(&out, dx.bitPattern)
     appendBE(&out, dy.bitPattern)
+    out.append(payload)
     return out
   }
 
@@ -143,11 +169,16 @@ private struct InputEvent {
     ev.clickState = body[idx]; idx += 1
     ev.dx = Double(bitPattern: readBE(body, &idx, UInt64.self))
     ev.dy = Double(bitPattern: readBE(body, &idx, UInt64.self))
+    if idx < body.endIndex { ev.raw = body.subdata(in: idx ..< body.endIndex) }
     return ev
   }
 }
 
 private let kSystemDefinedType = CGEventType(rawValue: 14)!
+// Multitouch gestures (pinch, rotate, smart zoom, swipe, force click) reach the
+// event tap as CG type 29; AppKit derives the NSEvent type from private fields.
+private let kGestureType = CGEventType(rawValue: 29)!
+private let kRawEventTypes: Set<UInt32> = [CGEventType.scrollWheel.rawValue, kGestureType.rawValue]
 
 private struct AuxiliaryKey {
   // IOKit/hidsystem/ev_keymap.h: documented auxiliary controls, plus MENU (25).
@@ -203,7 +234,9 @@ private func parseFrames(_ buffer: inout Data, _ handle: (InputEvent) -> Void) {
   while buffer.count >= 4 {
     var idx = buffer.startIndex
     let len = Int(readBE(buffer, &idx, UInt32.self))
-    guard len == kRecordSize else { buffer.removeAll(keepingCapacity: true); return }
+    guard len >= kRecordSize, len <= kRecordSize + kRawEventMax else {
+      buffer.removeAll(keepingCapacity: true); return
+    }
     guard buffer.count >= 4 + len else { return }
     let body = buffer.subdata(in: idx ..< idx + len)
     buffer.removeSubrange(buffer.startIndex ..< idx + len)
@@ -643,8 +676,8 @@ private final class Node {
   private var pendingMotion: CGEvent?
 
   // edge-of-screen switching
-  private var edgePressure = 0.0   // controller side: push into the exit edge
-  private var recvPressure = 0.0   // receiver side: push into the return edge
+  private var edgePressure = EdgePressure() // controller side: push into the exit edge
+  private var recvPressure = EdgePressure() // receiver side: push into the return edge
   private var outBuffer = Data()
 
   private var tapPort: CFMachPort?
@@ -658,7 +691,7 @@ private final class Node {
       .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
       .otherMouseDown, .otherMouseUp,
       .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
-      .scrollWheel,
+      .scrollWheel, kGestureType,
     ]
     return types.reduce(0) { $0 | (1 << $1.rawValue) }
   }()
@@ -826,7 +859,7 @@ private final class Node {
     inBuffer.removeAll(keepingCapacity: true)
     incomingConnected = false
     incomingPeer = nil
-    recvPressure = 0
+    recvPressure.reset()
     notify()
   }
 
@@ -913,7 +946,7 @@ private final class Node {
         becomeLocal()
         releaseInjectedInput()
         cursor = CGEvent(source: nil)?.location ?? cursor
-        recvPressure = 0
+        recvPressure.reset()
         receivingRemote = true
         log("receiving remote input session")
         incomingSession = ev.flags
@@ -997,11 +1030,19 @@ private final class Node {
   private func inject(_ ev: InputEvent) {
     guard let injectSource = injectSource else { return }
     guard let type = CGEventType(rawValue: ev.cgType) else { return }
+    if Node.keyboardTypes.contains(type) { recvPressure.reset() }
     let flags = CGEventFlags(rawValue: ev.flags)
     // A modifier can already be held when the session starts, so its initial
     // flagsChanged may have stayed on the source Mac. Track it for cleanup too.
     for (key, bit) in Node.modifierBit where key != 57 && ev.flags & bit != 0 {
       injectedKeys.insert(key)
+    }
+    if let raw = ev.raw {
+      guard receivingRemote, let e = Node.rawEvent(type: type, raw: raw) else { return }
+      e.location = cursor
+      e.timestamp = DispatchTime.now().uptimeNanoseconds
+      emit(e)
+      return
     }
     switch type {
     case .keyDown, .keyUp:
@@ -1063,6 +1104,14 @@ private final class Node {
     }
   }
 
+  // Only scroll and gesture events may arrive serialized: the peer must not be
+  // able to replay keys or clicks outside the tracked injection paths.
+  static func rawEvent(type: CGEventType, raw: Data) -> CGEvent? {
+    guard kRawEventTypes.contains(type.rawValue), raw.count <= kRawEventMax,
+          let e = CGEvent(withDataAllocator: nil, data: raw as CFData), e.type == type else { return nil }
+    return e
+  }
+
   private func moveCursor(dx: Double, dy: Double) {
     let b = displayBounds
     cursor.x = min(max(b.minX, cursor.x + dx), b.maxX - 1)
@@ -1085,10 +1134,9 @@ private final class Node {
     guard config.edgeEnabled, receivingRemote, monotonicNow() >= edgeResumeAt,
           let conn = incomingConn else { return }
     let push = edgePush(cursor, dx, dy, config.edgeDirection)
-    if push < 0 { recvPressure = 0; return }
-    recvPressure += push
-    if recvPressure >= kEdgeThreshold {
-      recvPressure = 0
+    recvPressure.add(push)
+    if recvPressure.amount >= kEdgeThreshold {
+      recvPressure.reset()
       receivingRemote = false
       releaseInjectedInput()
       reply(kCtrlReturn, token: incomingSession, on: conn)
@@ -1173,7 +1221,7 @@ private final class Node {
         self.lastPong = -Double.infinity
         self.pendingPings.removeAll()
         self.outBuffer.removeAll(keepingCapacity: true)
-        self.edgePressure = 0
+        self.edgePressure.reset()
         self.receiveControl(conn)
         self.healthTick()
         self.notify()
@@ -1202,7 +1250,7 @@ private final class Node {
     outgoingSession = 0
     pendingBegin = nil
     cursorGuard?.release()
-    edgePressure = 0
+    edgePressure.reset()
     edgeResumeAt = monotonicNow() + 0.5
     if wasSending, let conn = outConn {
       sendData(controlRecord(kCtrlEnd, token: session), on: conn)
@@ -1333,13 +1381,29 @@ private final class Node {
       return Unmanaged.passUnretained(event)
     }
 
-    // Physical input on the receiving Mac takes ownership. Injected events
-    // already returned above, so they cannot trigger a feedback loop.
+    // Typing ends the previous edge gesture on either side of the connection.
+    if Node.keyboardTypes.contains(type) {
+      edgePressure.reset()
+      recvPressure.reset()
+    }
+
+    // An untagged event is not necessarily physical: apps can post Enter/paste
+    // and cursor notifications without our stamp. Keep those local without
+    // ending the remote session or treating them as a switch shortcut.
     if receivingRemote {
+      guard event.getIntegerValueField(.eventSourceUnixProcessID) == 0 else {
+        return Unmanaged.passUnretained(event)
+      }
+      if Node.moveTypes.contains(type),
+         event.getDoubleValueField(.mouseEventDeltaX) == 0,
+         event.getDoubleValueField(.mouseEventDeltaY) == 0 {
+        return Unmanaged.passUnretained(event)
+      }
       receivingRemote = false
       releaseInjectedInput()
       if let conn = incomingConn { reply(kCtrlReturn, token: incomingSession, on: conn) }
       edgeResumeAt = monotonicNow() + 0.5
+      log("local input: returning control to controller (event type=\(type.rawValue))")
     }
     if mode == .remote && (!linkHealthy || cursorGuard?.healthy == false) { becomeLocal() }
     let flags = event.flags
@@ -1377,14 +1441,10 @@ private final class Node {
       let dx = event.getDoubleValueField(.mouseEventDeltaX)
       let dy = event.getDoubleValueField(.mouseEventDeltaY)
       let push = edgePush(event.location, dx, dy, config.edgeDirection)
-      if push < 0 {
-        edgePressure = 0
-      } else {
-        edgePressure += push
-        if edgePressure >= kEdgeThreshold, linkHealthy {
-          edgePressure = 0
-          toggleMode() // -> remote
-        }
+      edgePressure.add(push)
+      if edgePressure.amount >= kEdgeThreshold, linkHealthy {
+        edgePressure.reset()
+        toggleMode() // -> remote
       }
     }
 
@@ -1447,6 +1507,10 @@ private final class Node {
     .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
   ]
 
+  private static let keyboardTypes: Set<CGEventType> = [
+    .keyDown, .keyUp, .flagsChanged, kSystemDefinedType,
+  ]
+
   private func forward(type: CGEventType, event: CGEvent, flags: CGEventFlags) -> Bool {
     var ev = InputEvent()
     ev.cgType = type.rawValue
@@ -1473,10 +1537,19 @@ private final class Node {
     case .scrollWheel:
       ev.dy = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
       ev.dx = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
+      ev.raw = Node.serialized(event)
+    case kGestureType:
+      guard let raw = Node.serialized(event) else { return false }
+      ev.raw = raw
     default:
       return false
     }
     return send(ev)
+  }
+
+  private static func serialized(_ event: CGEvent) -> Data? {
+    guard let data = event.data as Data?, data.count <= kRawEventMax else { return nil }
+    return data
   }
 
   func stop() {
